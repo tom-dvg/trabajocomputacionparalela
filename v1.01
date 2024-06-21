@@ -1,0 +1,206 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <map>
+#include <unordered_map>
+#include <iomanip>
+
+// Estructura para almacenar datos
+struct Product {
+    std::string created;
+    std::string sku;
+    double amount;
+
+    Product(const std::string& created, const std::string& sku, double amount)
+        : created(created), sku(sku), amount(amount) {}
+};
+
+// Función para dividir una cadena por un delimitador
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool inQuotes = false;
+    std::istringstream tokenStream(str);
+
+    while (tokenStream.good()) {
+        char c = tokenStream.get();
+        if (c == '"') {
+            inQuotes = !inQuotes;
+        } else if (c == delimiter && !inQuotes) {
+            tokens.push_back(token);
+            token.clear();
+        } else {
+            token += c;
+        }
+    }
+    tokens.push_back(token); // Añadir el último token
+    return tokens;
+}
+
+// Función para eliminar espacios y comillas
+std::string trim(const std::string& str) {
+    size_t start = str.find_first_not_of(" \"\t\r\n");
+    size_t end = str.find_last_not_of(" \"\t\r\n");
+    return (start == std::string::npos || end == std::string::npos) ? "" : str.substr(start, end - start + 1);
+}
+
+// Función para extraer el mes y año de una fecha
+std::string getMonthYear(const std::string& date) {
+    return date.substr(0, 7); // "YYYY-MM"
+}
+
+// Función para dividir el archivo grande en archivos más pequeños
+void splitLargeFile(const std::string& filename, size_t linesPerFile) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    std::string line;
+    size_t fileIndex = 0;
+    size_t lineCount = 0;
+    std::ofstream outfile;
+
+    while (std::getline(infile, line)) {
+        if (lineCount % linesPerFile == 0) {
+            if (outfile.is_open()) {
+                outfile.close();
+            }
+            outfile.open("part_" + std::to_string(fileIndex++) + ".csv");
+        }
+        outfile << line << "\n";
+        lineCount++;
+    }
+
+    if (outfile.is_open()) {
+        outfile.close();
+    }
+}
+
+// Función para procesar archivos pequeños y contar repeticiones de SKU por mes y año
+void processSmallFiles(size_t totalFiles) {
+    for (size_t i = 0; i < totalFiles; ++i) {
+        std::ifstream infile("part_" + std::to_string(i) + ".csv");
+        if (!infile.is_open()) {
+            throw std::runtime_error("No se pudo abrir el archivo: part_" + std::to_string(i) + ".csv");
+        }
+
+        std::unordered_map<std::string, std::unordered_map<std::string, int>> skuCountByMonthYear;
+        std::string line;
+        size_t lineCount = 0;
+
+        // Leer y procesar cada línea
+        while (std::getline(infile, line)) {
+            std::vector<std::string> tokens = split(line, ';');
+
+            // Asegurarse de que la línea tiene suficientes columnas
+            if (tokens.size() < 7) {
+                continue;
+            }
+
+            std::string created = trim(tokens[0]);
+            std::string sku = trim(tokens[6]);
+
+            std::string monthYear = getMonthYear(created);
+            skuCountByMonthYear[monthYear][sku]++;
+
+            lineCount++;
+        }
+
+        infile.close();
+
+        // Escribir los resultados en archivos
+        std::ofstream outfile("result_" + std::to_string(i) + ".csv");
+        for (const auto& [monthYear, skuCounts] : skuCountByMonthYear) {
+            for (const auto& [sku, count] : skuCounts) {
+                outfile << monthYear << "," << sku << "," << count << "\n";
+            }
+        }
+        outfile.close();
+    }
+}
+
+// Función para combinar resultados de archivos pequeños y calcular la inflación
+void combineResultsAndCalculateInflation(size_t totalFiles) {
+    std::unordered_map<std::string, std::unordered_map<std::string, double>> skuPricesByMonthYear;
+
+    // Leer archivos de resultados
+    for (size_t i = 0; i < totalFiles; ++i) {
+        std::ifstream infile("result_" + std::to_string(i) + ".csv");
+        if (!infile.is_open()) {
+            throw std::runtime_error("No se pudo abrir el archivo: result_" + std::to_string(i) + ".csv");
+        }
+
+        std::string line;
+        while (std::getline(infile, line)) {
+            std::vector<std::string> tokens = split(line, ',');
+
+            if (tokens.size() != 3) {
+                continue;
+            }
+
+            std::string monthYear = tokens[0];
+            std::string sku = tokens[1];
+            double count = std::stod(tokens[2]);
+
+            skuPricesByMonthYear[monthYear][sku] += count;
+        }
+
+        infile.close();
+    }
+
+    // Calcular precios promedio por SKU
+    std::unordered_map<std::string, double> basePrices;
+    std::string baseMonthYear = "2023-01"; // Por ejemplo, usar enero 2023 como período base
+
+    if (skuPricesByMonthYear.find(baseMonthYear) != skuPricesByMonthYear.end()) {
+        for (const auto& [sku, total] : skuPricesByMonthYear[baseMonthYear]) {
+            basePrices[sku] = total;
+        }
+    }
+
+    // Calcular el IPC y la inflación
+    for (const auto& [monthYear, skuCounts] : skuPricesByMonthYear) {
+        if (monthYear == baseMonthYear) continue;
+
+        double ipc = 0.0;
+        double baseIpc = 0.0;
+
+        for (const auto& [sku, total] : skuCounts) {
+            if (basePrices.find(sku) != basePrices.end()) {
+                ipc += total;
+                baseIpc += basePrices[sku];
+            }
+        }
+
+        if (baseIpc > 0) {
+            double inflation = ((ipc - baseIpc) / baseIpc) * 100.0;
+            std::cout << "Inflación en " << monthYear << ": " << std::fixed << std::setprecision(2) << inflation << "%" << std::endl;
+        }
+    }
+}
+
+// Función principal
+int main() {
+    try {
+        // Dividir el archivo grande en archivos más pequeños
+        std::string filename = "D:\\Trabajo paralela\\pd.csv";
+        splitLargeFile(filename, 1000000); // Dividir en archivos de 1 millón de líneas
+
+        // Procesar los archivos pequeños y contar repeticiones de SKU por mes y año
+        size_t totalFiles = 57; // Número de archivos pequeños generados
+        processSmallFiles(totalFiles);
+
+        // Combinar resultados y calcular la inflación
+        combineResultsAndCalculateInflation(totalFiles);
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    std::cout << "Presione una tecla para continuar . . ." << std::endl;
+    std::cin.get();
+    return 0;
+}
