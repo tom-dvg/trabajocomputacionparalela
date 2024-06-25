@@ -1,0 +1,325 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <algorithm>
+#include <queue>
+#include <cstdio>
+#include <omp.h>
+
+const size_t BLOCK_SIZE = 100000; // Tamaño del bloque en líneas (ajustar según la memoria disponible)
+
+// Función para dividir una cadena por un delimitador
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool inQuotes = false;
+    std::istringstream tokenStream(str);
+
+    while (tokenStream.good()) {
+        char c = tokenStream.get();
+        if (c == '"') {
+            inQuotes = !inQuotes;
+        } else if (c == delimiter && !inQuotes) {
+            tokens.push_back(token);
+            token.clear();
+        } else {
+            token += c;
+        }
+    }
+    tokens.push_back(token); // Añadir el último token
+    return tokens;
+}
+
+// Función para eliminar espacios y comillas
+std::string trim(const std::string& str) {
+    size_t start = str.find_first_not_of(" \"\t\r\n");
+    size_t end = str.find_last_not_of(" \"\t\r\n");
+    return (start == std::string::npos || end == std::string::npos) ? "" : str.substr(start, end - start + 1);
+}
+
+// Función para extraer el año y el mes de una fecha
+std::string getYearMonth(const std::string& date) {
+    return date.substr(0, 7); // "YYYY-MM"
+}
+
+// Función para extraer el mes de una fecha
+std::string getMonth(const std::string& date) {
+    return date.substr(5, 2); // "MM"
+}
+
+// Función para dividir el archivo grande en archivos mensuales directamente en paralelo
+int splitFileByMonthDirectly(const std::string& filename) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    std::unordered_map<std::string, std::ofstream> monthFiles;
+    std::string line;
+    bool isFirstLine = true;
+    int errorCount = 0;
+
+    std::vector<std::string> lines;
+    while (std::getline(infile, line)) {
+        if (isFirstLine) {
+            isFirstLine = false;
+            for (int year = 2021; year <= 2024; ++year) {
+                for (int month = 1; month <= 12; ++month) {
+                    std::string monthStr = (month < 10) ? "0" + std::to_string(month) : std::to_string(month);
+                    std::string monthFilename = std::to_string(year) + "_" + monthStr + ".csv";
+                    monthFiles[monthFilename] = std::ofstream(monthFilename);
+                    monthFiles[monthFilename] << line << "\n"; // Write header to each file
+                }
+            }
+        } else {
+            lines.push_back(line);
+        }
+    }
+    infile.close();
+
+    int numThreads = omp_get_max_threads();
+
+    #pragma omp parallel for num_threads(numThreads) reduction(+:errorCount)
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::vector<std::string> tokens = split(lines[i], ';');
+        if (tokens.size() < 1) {
+            ++errorCount;
+            continue;
+        }
+
+        std::string yearMonthStr = getYearMonth(trim(tokens[0]));
+        if (yearMonthStr.size() != 7) {
+            ++errorCount;
+            continue;
+        }
+
+        #pragma omp critical
+        {
+            std::string monthFilename = yearMonthStr + ".csv";
+            if (monthFiles.find(monthFilename) != monthFiles.end()) {
+                monthFiles[monthFilename] << lines[i] << "\n";
+            } else {
+                ++errorCount;
+            }
+        }
+    }
+
+    for (auto& [monthFilename, file] : monthFiles) {
+        file.close();
+    }
+
+    return errorCount;
+}
+
+// Función QuickSort paralela
+void quickSortParallel(std::vector<std::string>& vec, int left, int right, int depth) {
+    if (left < right) {
+        if (depth <= 0) {
+            std::sort(vec.begin() + left, vec.begin() + right + 1, [](const std::string& a, const std::string& b) {
+                std::string dateA = trim(split(a, ';')[0]);
+                std::string dateB = trim(split(b, ';')[0]);
+                return dateA < dateB;
+            });
+        } else {
+            int i = left, j = right;
+            std::string pivot = vec[(left + right) / 2];
+            std::string datePivot = trim(split(pivot, ';')[0]);
+
+            while (i <= j) {
+                while (trim(split(vec[i], ';')[0]) < datePivot) {
+                    i++;
+                }
+                while (trim(split(vec[j], ';')[0]) > datePivot) {
+                    j--;
+                }
+                if (i <= j) {
+                    std::swap(vec[i], vec[j]);
+                    i++;
+                    j--;
+                }
+            }
+
+            #pragma omp parallel sections
+            {
+                #pragma omp section
+                {
+                    quickSortParallel(vec, left, j, depth - 1);
+                }
+                #pragma omp section
+                {
+                    quickSortParallel(vec, i, right, depth - 1);
+                }
+            }
+        }
+    }
+}
+
+// Función para ordenar un archivo por fecha usando QuickSort paralelo
+void externalSort(const std::string& filename) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    std::string header;
+    std::getline(infile, header);
+
+    std::vector<std::string> lines;
+    std::vector<std::string> tempFiles;
+    std::string line;
+    size_t blockNumber = 0;
+
+    // Leer y ordenar bloques
+    while (std::getline(infile, line)) {
+        lines.push_back(line);
+        if (lines.size() == BLOCK_SIZE) {
+            quickSortParallel(lines, 0, lines.size() - 1, omp_get_max_threads());
+
+            std::string tempFileName = "temp_" + std::to_string(blockNumber++) + ".csv";
+            std::ofstream outfile(tempFileName);
+            for (const auto& sortedLine : lines) {
+                outfile << sortedLine << "\n";
+            }
+            outfile.close();
+            tempFiles.push_back(tempFileName);
+            lines.clear();
+        }
+    }
+
+    // Ordenar y escribir el último bloque si existe
+    if (!lines.empty()) {
+        quickSortParallel(lines, 0, lines.size() - 1, omp_get_max_threads());
+
+        std::string tempFileName = "temp_" + std::to_string(blockNumber++) + ".csv";
+        std::ofstream outfile(tempFileName);
+        for (const auto& sortedLine : lines) {
+            outfile << sortedLine << "\n";
+        }
+        outfile.close();
+        tempFiles.push_back(tempFileName);
+        lines.clear();
+    }
+
+    infile.close();
+
+    // Mezclar archivos temporales
+    std::ofstream outfile(filename);
+    outfile << header << "\n"; // Escribir el encabezado
+    std::vector<std::ifstream> tempStreams;
+    for (const auto& tempFile : tempFiles) {
+        tempStreams.emplace_back(tempFile);
+    }
+
+    auto compare = [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
+        return a.first > b.first; // Invertido para crear una min-heap
+    };
+    std::priority_queue<std::pair<std::string, int>, std::vector<std::pair<std::string, int>>, decltype(compare)> pq(compare);
+
+    for (int i = 0; i < tempStreams.size(); ++i) {
+        if (std::getline(tempStreams[i], line)) {
+            pq.emplace(line, i);
+        }
+    }
+
+    while (!pq.empty()) {
+        auto [sortedLine, index] = pq.top();
+        pq.pop();
+        outfile << sortedLine << "\n";
+        if (std::getline(tempStreams[index], line)) {
+            pq.emplace(line, index);
+        }
+    }
+
+    outfile.close();
+
+    // Eliminar archivos temporales
+    for (const auto& tempFile : tempFiles) {
+        std::remove(tempFile.c_str());
+    }
+}
+
+// Función para combinar archivos mensuales en un archivo anual ordenado
+void combineFilesByYear(const std::string& year) {
+    std::ofstream outfile(year + "_ordenado.csv");
+    std::vector<std::ifstream> monthFiles;
+
+    for (int month = 1; month <= 12; ++month) {
+        std::string monthStr = (month < 10) ? "0" + std::to_string(month) : std::to_string(month);
+        std::string monthFilename = year + "_" + monthStr + ".csv";
+        monthFiles.emplace_back(monthFilename);
+    }
+
+    std::string header;
+    bool isFirstLine = true;
+
+    for (auto& monthFile : monthFiles) {
+        if (!monthFile.is_open()) continue;
+
+        std::string line;
+        if (isFirstLine) {
+            std::getline(monthFile, header);
+            outfile << header << "\n";
+            isFirstLine = false;
+        } else {
+            std::getline(monthFile, line); // Skip header line
+        }
+
+        while (std::getline(monthFile, line)) {
+            outfile << line << "\n";
+        }
+    }
+
+    outfile.close();
+    for (auto& monthFile : monthFiles) {
+        monthFile.close();
+    }
+}
+
+int main() {
+    try {
+        int numThreads = omp_get_max_threads(); // Obtener el número máximo de hilos disponibles
+        std::cout << "Número de núcleos encontrados: " << numThreads << std::endl;
+
+        // Dividir el archivo grande en archivos mensuales directamente usando todos los núcleos disponibles
+        std::string filename = "D:\\Trabajo paralela\\pd.csv";
+        std::cout << "Dividiendo el archivo por mes..." << std::endl;
+        int errorCount;
+        errorCount = splitFileByMonthDirectly(filename);
+
+        std::cout << "Archivo dividido por mes correctamente." << std::endl;
+        std::cout << "Número de líneas con error: " << errorCount << std::endl;
+
+        std::cout << "Ordenando archivos mensuales..." << std::endl;
+
+        // Ordenar cada archivo mensual en paralelo usando todos los núcleos disponibles
+        for (int year = 2021; year <= 2024; ++year) {
+            #pragma omp parallel for num_threads(numThreads)
+            for (int month = 1; month <= 12; ++month) {
+                std::string monthStr = (month < 10) ? "0" + std::to_string(month) : std::to_string(month);
+                std::string monthFilename = std::to_string(year) + "_" + monthStr + ".csv";
+                externalSort(monthFilename);
+            }
+        }
+
+        std::cout << "Combinando archivos mensuales en archivos anuales ordenados..." << std::endl;
+
+        // Combinar los archivos mensuales en archivos anuales ordenados
+        #pragma omp parallel for num_threads(numThreads)
+        for (int i = 0; i < 4; ++i) {
+            int year = 2021 + i;
+            combineFilesByYear(std::to_string(year));
+        }
+
+        std::cout << "Todos los archivos han sido divididos, ordenados y combinados correctamente." << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    std::cout << "Presione una tecla para continuar . . ." << std::endl;
+    std::cin.get();
+    return 0;
+}
