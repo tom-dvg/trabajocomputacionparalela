@@ -1,0 +1,245 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <algorithm>
+#include <omp.h>
+#include <filesystem>
+
+// Función para dividir una cadena por un delimitador
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool inQuotes = false;
+    std::istringstream tokenStream(str);
+
+    while (tokenStream.good()) {
+        char c = tokenStream.get();
+        if (c == '"') {
+            inQuotes = !inQuotes;
+        } else if (c == delimiter && !inQuotes) {
+            tokens.push_back(token);
+            token.clear();
+        } else {
+            token += c;
+        }
+    }
+    tokens.push_back(token); // Añadir el último token
+    return tokens;
+}
+
+// Función para eliminar espacios y comillas
+std::string trim(const std::string& str) {
+    size_t start = str.find_first_not_of(" \"\t\r\n");
+    size_t end = str.find_last_not_of(" \"\t\r\n");
+    return (start == std::string::npos || end == std::string::npos) ? "" : str.substr(start, end - start + 1);
+}
+
+// Función para extraer el año de una fecha
+std::string getYear(const std::string& date) {
+    return date.substr(0, 4); // "YYYY"
+}
+
+// Función para extraer el año y el mes de una fecha
+std::string getYearMonth(const std::string& date) {
+    return date.substr(0, 7); // "YYYY-MM"
+}
+
+// Función para dividir el archivo grande en archivos por año directamente
+void splitFileByYearDirectly(const std::string& filename, int startYear, int endYear, const std::string& outputDir) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    // Crear el directorio de salida si no existe
+    std::filesystem::create_directory(outputDir);
+
+    std::unordered_map<int, std::ofstream> yearFiles;
+    for (int year = startYear; year <= endYear; ++year) {
+        std::string outputFileName = outputDir + "/year_" + std::to_string(year) + ".csv";
+        yearFiles[year] = std::ofstream(outputFileName);
+        if (!yearFiles[year].is_open()) {
+            throw std::runtime_error("No se pudo crear el archivo para el año: " + std::to_string(year));
+        }
+    }
+
+    std::string line;
+    bool isFirstLine = true;
+
+    // Leer el archivo grande y escribir directamente en el archivo correspondiente por año
+    while (std::getline(infile, line)) {
+        if (isFirstLine) {
+            isFirstLine = false;
+            // Escribir la línea de encabezado en todos los archivos
+            for (auto& [year, file] : yearFiles) {
+                file << line << "\n";
+            }
+            continue;
+        }
+
+        std::vector<std::string> tokens = split(line, ';');
+        if (tokens.size() < 1) {
+            continue;
+        }
+
+        std::string yearStr = getYear(trim(tokens[0]));
+        int year;
+        try {
+            year = std::stoi(yearStr);
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "Error de conversión: " << e.what() << " en la línea: " << line << std::endl;
+            continue;
+        } catch (const std::out_of_range& e) {
+            std::cerr << "Valor fuera de rango: " << e.what() << " en la línea: " << line << std::endl;
+            continue;
+        }
+
+        if (year >= startYear && year <= endYear) {
+            yearFiles[year] << line << "\n";
+        }
+    }
+
+    infile.close();
+    for (auto& [year, file] : yearFiles) {
+        file.close();
+    }
+}
+
+// Función para procesar un archivo anual y dividirlo en archivos mensuales
+void processYearFile(const std::string& filename, const std::string& outputDir) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    std::string header;
+    std::getline(infile, header);
+
+    std::unordered_map<std::string, std::vector<std::string>> yearMonthLines;
+    std::string line;
+
+    // Leer el archivo grande y clasificar las líneas por año y mes
+    while (std::getline(infile, line)) {
+        std::vector<std::string> tokens = split(line, ';');
+        if (tokens.size() < 1) {
+            continue;
+        }
+
+        std::string yearMonth = getYearMonth(trim(tokens[0]));
+        yearMonthLines[yearMonth].push_back(line);
+    }
+
+    infile.close();
+
+    // Crear el directorio de salida si no existe
+    std::filesystem::create_directory(outputDir);
+
+    // Dividir la carga de trabajo entre los hilos
+    #pragma omp parallel for
+    for (int i = 0; i < yearMonthLines.size(); ++i) {
+        auto it = yearMonthLines.begin();
+        std::advance(it, i);
+        std::string fileName = outputDir + "/" + it->first + ".csv";
+        std::vector<std::string>& lines = it->second;
+
+        std::ofstream outfile(fileName, std::ios::app);
+        if (!outfile.is_open()) {
+            #pragma omp critical
+            {
+                std::cerr << "No se pudo abrir el archivo: " + fileName << std::endl;
+            }
+            continue;
+        }
+
+        #pragma omp critical
+        {
+            outfile << header << "\n";
+            for (const auto& line : lines) {
+                outfile << line << "\n";
+            }
+        }
+        outfile.close();
+    }
+}
+
+// Función para combinar archivos mensuales en un solo archivo anual ordenado
+void combineMonthlyFilesToYearly(const std::string& year, const std::string& inputDir, const std::string& outputDir) {
+    std::string outFile = outputDir + "/year_" + year + "_ordenado.csv";
+    std::ofstream outStream(outFile);
+    if (!outStream.is_open()) {
+        throw std::runtime_error("No se pudo crear el archivo anual ordenado para el año: " + year);
+    }
+
+    bool headerWritten = false;
+
+    // Procesar los archivos mensuales en orden
+    for (int month = 1; month <= 12; ++month) {
+        std::string monthStr = (month < 10 ? "0" : "") + std::to_string(month);
+        std::string inFile = inputDir + "/" + year + "-" + monthStr + ".csv";  // Ajustado a "-" en lugar de "_"
+        std::ifstream inFileStream(inFile);
+        if (!inFileStream.is_open()) {
+            std::cerr << "Error: Archivo mensual no encontrado para: " + inFile << std::endl;
+            continue;
+        }
+
+        std::string line;
+        if (!headerWritten && std::getline(inFileStream, line)) {
+            outStream << line << "\n";
+            headerWritten = true;
+        } else {
+            std::getline(inFileStream, line); // Leer y descartar el encabezado
+        }
+
+        // Leer todas las líneas restantes del archivo mensual y escribirlas en el archivo anual
+        while (std::getline(inFileStream, line)) {
+            outStream << line << "\n";
+        }
+
+        inFileStream.close();
+    }
+
+    outStream.close();
+    std::cout << "Archivo anual creado: " << outFile << std::endl;
+}
+
+int main() {
+    int numThreads = omp_get_max_threads();
+    omp_set_num_threads(numThreads);
+
+    std::cout << "Número de núcleos encontrados: " << numThreads << std::endl;
+
+    try {
+        std::string inputFilename = "D:\\Trabajo paralela\\pd.csv";
+        std::string outputDir = "output";
+
+        // Paso 1: Dividir el archivo principal en archivos por año
+        std::cout << "Dividiendo el archivo principal en archivos por año..." << std::endl;
+        splitFileByYearDirectly(inputFilename, 2021, 2024, outputDir);
+
+        // Paso 2: Dividir los archivos anuales en archivos mensuales
+        std::cout << "Dividiendo los archivos anuales en archivos mensuales..." << std::endl;
+        std::vector<std::string> yearFiles = { outputDir + "/year_2021.csv", outputDir + "/year_2022.csv", outputDir + "/year_2023.csv", outputDir + "/year_2024.csv" };
+        for (const auto& yearFile : yearFiles) {
+            std::cout << "Procesando archivo: " << yearFile << std::endl;
+            processYearFile(yearFile, outputDir);
+        }
+
+        // Paso 3: Combinar los archivos mensuales en archivos anuales ordenados
+        std::cout << "Combinando archivos mensuales en archivos anuales ordenados..." << std::endl;
+        std::vector<std::string> years = { "2021", "2022", "2023", "2024" };
+        for (const auto& year : years) {
+            combineMonthlyFilesToYearly(year, outputDir, outputDir);
+        }
+
+        std::cout << "Archivos procesados y combinados correctamente." << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    std::cout << "Presione una tecla para continuar . . ." << std::endl;
+    std::cin.get();
+    return 0;
+}
