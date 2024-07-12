@@ -1,5 +1,0 @@
-Pasos para Compilar
-1. Abrir el terminal y navegar a la direccion del proyecto, nuevo a build
-2. Compilar usando:
-   "make"
-3. Utilizar "./mi_programa"
