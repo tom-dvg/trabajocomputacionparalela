@@ -1,0 +1,781 @@
+//Trabajo Computación Paralela y Distribuida
+// Javier Bravo
+// Tomás Díaz-Valdés
+// Pablo Castillo
+// Seccion 411
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <algorithm>
+#include <unordered_set>
+#include <omp.h>
+#include <filesystem>
+#include <set>
+#include <map>
+#include <iomanip>
+#include <numeric>
+#include <locale.h>
+#include <ctime>
+#include <chrono>
+
+using namespace std::chrono;
+
+// Función para dividir una cadena por un delimitador
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool inQuotes = false;
+    std::istringstream tokenStream(str);
+
+    while (tokenStream.good()) {
+        char c = tokenStream.get();
+        if (c == '"') {
+            inQuotes = !inQuotes;
+        } else if (c == delimiter && !inQuotes) {
+            tokens.push_back(token);
+            token.clear();
+        } else {
+            token += c;
+        }
+    }
+    tokens.push_back(token);
+    return tokens;
+}
+
+// Función para eliminar espacios y comillas
+std::string trim(const std::string& str) {
+    size_t start = str.find_first_not_of(" \"\t\r\n");
+    size_t end = str.find_last_not_of(" \"\t\r\n");
+    return (start == std::string::npos || end == std::string::npos) ? "" : str.substr(start, end - start + 1);
+}
+
+// Función para extraer el año de una fecha
+std::string getYear(const std::string& date) {
+    return date.substr(0, 4); // "YYYY"
+}
+
+// Función para extraer el año y el mes de una fecha
+std::string getYearMonth(const std::string& date) {
+    return date.substr(0, 7); // "YYYY-MM"
+}
+
+// Función para dividir el archivo grande en archivos por año directamente
+void splitFileByYearDirectly(const std::string& filename, int startYear, int endYear, const std::string& outputDir) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+    std::cout << "Eliminando datos sin fechas..." << std::endl;
+    // Crear el directorio de salida si no existe
+    std::filesystem::create_directory(outputDir);
+
+    std::unordered_map<int, std::ofstream> yearFiles;
+    for (int year = startYear; year <= endYear; ++year) {
+        std::string outputFileName = outputDir + "/year_" + std::to_string(year) + ".csv";
+        yearFiles[year] = std::ofstream(outputFileName);
+        if (!yearFiles[year].is_open()) {
+            throw std::runtime_error("No se pudo crear el archivo para el año: " + std::to_string(year));
+        }
+    }
+
+    std::string line;
+    bool isFirstLine = true;
+
+    // Leer el archivo grande y escribir directamente en el archivo correspondiente por año
+    while (std::getline(infile, line)) {
+        if (isFirstLine) {
+            isFirstLine = false;
+            // Escribir la línea de encabezado en todos los archivos
+            for (auto& [year, file] : yearFiles) {
+                file << line << "\n";
+            }
+            continue;
+        }
+
+        std::vector<std::string> tokens = split(line, ';');
+        if (tokens.size() < 1) {
+            continue;
+        }
+
+        std::string yearStr = getYear(trim(tokens[0]));
+        int year;
+        try {
+            year = std::stoi(yearStr);
+        } catch (const std::invalid_argument& e) {
+            //std::cerr << "Error de conversión: " << e.what() << " en la línea: " << line << std::endl;
+            continue;
+        } catch (const std::out_of_range& e) {
+            std::cerr << "Valor fuera de rango: " << e.what() << " en la línea: " << line << std::endl;
+            continue;
+        }
+
+        if (year >= startYear && year <= endYear) {
+            yearFiles[year] << line << "\n";
+        }
+    }
+
+    infile.close();
+    for (auto& [year, file] : yearFiles) {
+        file.close();
+    }
+}
+
+// Función para procesar un archivo anual y dividirlo en archivos mensuales
+void processYearFile(const std::string& filename, const std::string& outputDir) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    std::string header;
+    std::getline(infile, header);
+
+    std::unordered_map<std::string, std::vector<std::string>> yearMonthLines;
+    std::string line;
+
+    // Leer el archivo grande y clasificar las líneas por año y mes
+    while (std::getline(infile, line)) {
+        std::vector<std::string> tokens = split(line, ';');
+        if (tokens.size() < 1) {
+            continue;
+        }
+
+        std::string yearMonth = getYearMonth(trim(tokens[0]));
+        yearMonthLines[yearMonth].push_back(line);
+    }
+
+    infile.close();
+
+    // Crear el directorio de salida si no existe
+    std::filesystem::create_directory(outputDir);
+
+    // Dividir la carga de trabajo entre los hilos
+    #pragma omp parallel for
+    for (int i = 0; i < yearMonthLines.size(); ++i) {
+        auto it = yearMonthLines.begin();
+        std::advance(it, i);
+        std::string fileName = outputDir + "/" + it->first + ".csv";
+        std::vector<std::string>& lines = it->second;
+
+        std::ofstream outfile(fileName, std::ios::app);
+        if (!outfile.is_open()) {
+            #pragma omp critical
+            {
+                std::cerr << "No se pudo abrir el archivo: " + fileName << std::endl;
+            }
+            continue;
+        }
+
+        #pragma omp critical
+        {
+            outfile << header << "\n";
+            for (const auto& line : lines) {
+                outfile << line << "\n";
+            }
+        }
+        outfile.close();
+    }
+}
+
+// Estructura para almacenar los detalles del SKU
+struct SKUDetails {
+    std::string name;
+    double amount;
+};
+
+// Función para leer SKUs desde un archivo CSV
+std::unordered_map<std::string, SKUDetails> readSKUs(const std::string& filename, int skuColumnIndex, int nameColumnIndex, int amountColumnIndex) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo: " + filename);
+    }
+
+    std::unordered_map<std::string, SKUDetails> skus;
+    std::string line;
+    bool isFirstLine = true;
+    while (std::getline(file, line)) {
+        if (isFirstLine) {
+            isFirstLine = false;
+            continue;
+        }
+
+        std::vector<std::string> tokens = split(line, ';');
+        if (tokens.size() > std::max({skuColumnIndex, nameColumnIndex, amountColumnIndex})) {
+            SKUDetails details = { tokens[nameColumnIndex], std::stod(tokens[amountColumnIndex]) };
+            skus[tokens[skuColumnIndex]] = details;
+        }
+    }
+    file.close();
+    return skus;
+}
+
+// Función para obtener los SKUs comunes para un año específico
+std::unordered_map<std::string, SKUDetails> getCommonSKUsForYear(int year) {
+    std::filesystem::path currentPath = std::filesystem::current_path();
+    std::vector<std::filesystem::path> csvFiles;
+
+    for (int month = (year == 2021 ? 2 : 1); month <= (year == 2024 ? 4 : 12); ++month) {
+        std::string filename = std::to_string(year) + "-" + (month < 10 ? "0" : "") + std::to_string(month) + ".csv";
+        std::filesystem::path csvFilePath = currentPath / "output" / filename;
+        if (std::filesystem::exists(csvFilePath)) {
+            csvFiles.push_back(csvFilePath);
+        } else {
+            std::cerr << "Advertencia: No se encontró el archivo " << csvFilePath << std::endl;
+        }
+    }
+
+    if (csvFiles.size() < 2) {
+        throw std::runtime_error("Error: No se encontraron suficientes archivos CSV para el año " + std::to_string(year));
+    }
+
+    int skuColumnIndex = 6;
+    int nameColumnIndex = 8;
+    int amountColumnIndex = 9;
+
+    std::unordered_map<std::string, SKUDetails> commonSKUs = readSKUs(csvFiles[0].string(), skuColumnIndex, nameColumnIndex, amountColumnIndex);
+
+    #pragma omp parallel for
+    for (size_t i = 1; i < csvFiles.size(); ++i) {
+        std::unordered_map<std::string, SKUDetails> skus = readSKUs(csvFiles[i].string(), skuColumnIndex, nameColumnIndex, amountColumnIndex);
+        #pragma omp critical
+        {
+            for (auto it = commonSKUs.begin(); it != commonSKUs.end(); ) {
+                if (skus.find(it->first) == skus.end()) {
+                    it = commonSKUs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    return commonSKUs;
+}
+
+// Función para guardar los SKUs comunes en un archivo CSV
+void saveCommonSKUs(const std::unordered_map<std::string, SKUDetails>& skus, const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("No se pudo crear el archivo: " + filename);
+    }
+
+    file << "SKU;Nombre;Monto\n";
+    for (const auto& [sku, details] : skus) {
+        file << sku << ";" << details.name << ";" << details.amount << "\n";
+    }
+    file.close();
+}
+
+// Función para calcular los costos mensuales de la canasta básica
+void calculateMonthlyBasketCosts(const std::unordered_map<std::string, SKUDetails>& skus, const std::vector<std::string>& years, const std::string& inputDir, std::map<std::string, double>& monthlyCosts) {
+    #pragma omp parallel for
+    for (size_t y = 0; y < years.size(); ++y) {
+        for (int month = 1; month <= 12; ++month) {
+            std::string monthStr = (month < 10 ? "0" : "") + std::to_string(month);
+            std::string inFile = inputDir + "/" + years[y] + "-" + monthStr + ".csv";
+            if (!std::filesystem::exists(inFile)) {
+                continue;
+            }
+
+            std::ifstream inFileStream(inFile);
+            if (!inFileStream.is_open()) {
+                std::cerr << "Error: No se pudo abrir el archivo mensual: " + inFile << std::endl;
+                continue;
+            }
+
+            std::string line;
+            std::getline(inFileStream, line); // Leer y descartar el encabezado
+
+            double monthlyCost = 0.0;
+            std::unordered_set<std::string> countedSKUs;
+            while (std::getline(inFileStream, line)) {
+                std::vector<std::string> tokens = split(line, ';');
+                if (tokens.size() < 10) {
+                    continue;
+                }
+                std::string sku = tokens[6];
+                if (skus.find(sku) != skus.end() && countedSKUs.find(sku) == countedSKUs.end()) {
+                    monthlyCost += std::stod(tokens[9]);
+                    countedSKUs.insert(sku); // Asegurar que solo se cuenta una vez por mes
+                }
+            }
+
+            std::string date = years[y] + "-" + monthStr;
+            #pragma omp critical
+            {
+                monthlyCosts[date] = monthlyCost;
+            }
+        }
+    }
+}
+
+// Función para guardar los resultados en un archivo de texto
+void saveResultsToFile(const std::map<std::string, double>& monthlyCosts, const std::map<std::string, double>& annualInflation) {
+    std::ofstream outFile("output/resultados.txt");
+    if (!outFile.is_open()) {
+        throw std::runtime_error("No se pudo crear el archivo de resultados.");
+    }
+
+    outFile << "Costo de la canasta básica mensual:\n";
+    for (const auto& [date, cost] : monthlyCosts) {
+        outFile << date << ": " << cost << "\n";
+    }
+
+    outFile << "\nInflación intermensual:\n";
+    auto it = monthlyCosts.begin();
+    auto prev = it++;
+    while (it != monthlyCosts.end()) {
+        double inflation = ((it->second - prev->second) / prev->second) * 100;
+        outFile << "Comparacion " << prev->first << " - " << it->first << ": " << inflation << "%\n";
+        prev = it++;
+    }
+
+    outFile << "\nInflación anual:\n";
+    double totalAnnualInflation = 0.0;
+    for (const auto& [year, inflation] : annualInflation) {
+        outFile << "Inflación para " << year << ": " << std::fixed << std::setprecision(2) << inflation << "%\n";
+        totalAnnualInflation += inflation;
+    }
+    outFile << "Variación total de inflación anual para la Canasta Basica (2021-2024): " << std::fixed << std::setprecision(2) << totalAnnualInflation << "%\n";
+
+    outFile.close();
+}
+
+void calculateInflation(const std::map<std::string, double>& monthlyCosts, std::map<std::string, double>& annualInflation) {
+    std::map<int, double> yearlyInflation;
+    double totalInflation = 0.0;
+    auto it = monthlyCosts.begin();
+    auto prev = it++;
+    while (it != monthlyCosts.end()) {
+        double inflation = ((it->second - prev->second) / prev->second) * 100;
+        int year = std::stoi(it->first.substr(0, 4));
+        yearlyInflation[year] += inflation;
+        totalInflation += inflation;
+        prev = it++;
+    }
+    for (const auto& [year, inflation] : yearlyInflation) {
+        annualInflation[std::to_string(year)] = inflation;
+    }
+}
+
+std::map<std::string, double> readExchangeRates(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo de tipos de cambio: " + filename);
+    }
+
+    std::map<std::string, double> exchangeRates;
+    std::string line;
+
+    // Saltar las primeras líneas innecesarias
+    while (std::getline(file, line)) {
+        if (line.find("Date") != std::string::npos) {
+            break;
+        }
+    }
+
+    while (std::getline(file, line)) {
+        std::vector<std::string> tokens = split(line, ',');
+        if (tokens.size() >= 2) {
+            std::string date = tokens[0];
+            std::string rateStr = tokens[1].substr(3); // Quitar el " $ " antes de convertir a double
+            std::replace(rateStr.begin(), rateStr.end(), ',', '.'); // Reemplazar coma por punto para std::stod
+            rateStr.erase(std::remove_if(rateStr.begin(), rateStr.end(), ::isspace), rateStr.end()); // Eliminar espacios en blanco
+            try {
+                double rate = std::stod(rateStr);
+                exchangeRates[date] = rate;
+            } catch (const std::invalid_argument& e) {
+                std::cerr << "Error de conversión en la línea de tipo de cambio: " << line << std::endl;
+            }
+        }
+    }
+    file.close();
+    return exchangeRates;
+}
+
+// Función para convertir string a time_t
+std::time_t stringToTimeT(const std::string& date) {
+    std::tm tm = {};
+    std::istringstream ss(date);
+    ss >> std::get_time(&tm, "%d/%m/%Y");
+    return std::mktime(&tm);
+}
+
+// Función para obtener el mes y el año en formato YYYY-MM
+std::string getMonthYear(const std::string& date) {
+    std::tm tm = {};
+    std::istringstream ss(date);
+    ss >> std::get_time(&tm, "%d/%m/%Y");
+    char buffer[8];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m", &tm);
+    return std::string(buffer);
+}
+
+// Función para calcular los promedios del tipo de cambio para cada mes entre dos fechas
+std::map<std::string, double> calculateMonthlyAverages(const std::map<std::string, double>& exchangeRates, const std::string& startDate, const std::string& endDate) {
+    std::map<std::string, std::vector<double>> monthlyRates;
+    std::map<std::string, double> monthlyAverages;
+
+    std::time_t start = stringToTimeT(startDate);
+    std::time_t end = stringToTimeT(endDate);
+
+    for (const auto& [date, rate] : exchangeRates) {
+        std::time_t current = stringToTimeT(date);
+        if (current >= start && current <= end) {
+            std::string monthYear = getMonthYear(date);
+            monthlyRates[monthYear].push_back(rate);
+        }
+    }
+
+    for (const auto& [monthYear, rates] : monthlyRates) {
+        double sum = std::accumulate(rates.begin(), rates.end(), 0.0);
+        double average = sum / rates.size();
+        monthlyAverages[monthYear] = average;
+    }
+
+    return monthlyAverages;
+}
+
+// Función para convertir los resultados a CLP y guardarlos en el archivo de salida
+void convertAndSaveResultsToCLP(const std::string& inputFilename, const std::string& outputFilename, const std::map<std::string, double>& monthlyAverages, const std::string& startDate, const std::string& endDate) {
+    std::ifstream inputFile(inputFilename);
+    if (!inputFile.is_open()) {
+        throw std::runtime_error("No se pudo abrir el archivo de resultados: " + inputFilename);
+    }
+
+    std::ofstream outputFile(outputFilename);
+    if (!outputFile.is_open()) {
+        throw std::runtime_error("No se pudo crear el archivo de resultados en CLP: " + outputFilename);
+    }
+
+    std::map<std::string, double> resultsInCLP;
+
+    // Convertir los costos de la canasta básica mensual en CLP
+    std::string line;
+    while (std::getline(inputFile, line)) {
+        if (line.find(':') != std::string::npos) {
+            size_t pos = line.find(':');
+            if (pos != std::string::npos && pos + 1 < line.size()) {
+                std::string date = line.substr(0, pos);
+                std::string amountStr = line.substr(pos + 2);
+                amountStr.erase(std::remove_if(amountStr.begin(), amountStr.end(), ::isspace), amountStr.end()); // Eliminar espacios en blanco
+                try {
+                    double amount = std::stod(amountStr);
+                    if (date.size() >= 7) {
+                        std::string monthYear = date; // Obtener el año y el mes de la fecha
+                        if (monthlyAverages.find(monthYear) != monthlyAverages.end()) {
+                            double averageRate = monthlyAverages.at(monthYear);
+                            double amountInCLP = amount * averageRate;
+                            resultsInCLP[date] = amountInCLP;
+                        }
+                    }
+                } catch (const std::invalid_argument& e) {
+                    std::cerr << "Error de conversión en la línea: " << line << std::endl;
+                }
+            }
+        }
+    }
+
+    // Imprimir y guardar tipos de cambio promedio mensuales
+    outputFile << "Tipos de cambio promedio mensuales (PEN a CLP) desde " << startDate << " hasta " << endDate << ":\n";
+    for (const auto& [monthYear, averageRate] : monthlyAverages) {
+        outputFile << monthYear << ": " << averageRate << "\n";
+    }
+
+    // Imprimir y guardar costos de la canasta básica mensual en CLP
+    outputFile << "\nCosto de la canasta básica mensual en CLP:\n";
+    for (const auto& [date, amountInCLP] : resultsInCLP) {
+        outputFile << date << ": " << std::fixed << std::setprecision(2) << amountInCLP << "\n";
+    }
+
+    inputFile.close();
+    outputFile.close();
+}
+
+// Función para imprimir el contenido de un archivo
+void printFileContents(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "No se pudo abrir el archivo: " << filename << std::endl;
+        return;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        std::cout << line << std::endl;
+    }
+    file.close();
+}
+
+void findAndSumMatchingSKUs(const std::unordered_map<std::string, SKUDetails>& skus, const std::vector<std::string>& years, const std::string& inputDir, std::map<std::string, double>& monthlyCosts) {
+    #pragma omp parallel for
+    for (size_t y = 0; y < years.size(); ++y) {
+        for (int month = 1; month <= 12; ++month) {
+            std::string monthStr = (month < 10 ? "0" : "") + std::to_string(month);
+            std::string inFile = inputDir + "/" + years[y] + "-" + monthStr + ".csv";
+            if (!std::filesystem::exists(inFile)) {
+                continue;
+            }
+
+            std::ifstream inFileStream(inFile);
+            if (!inFileStream.is_open()) {
+                std::cerr << "Error: No se pudo abrir el archivo mensual: " + inFile << std::endl;
+                continue;
+            }
+
+            std::string line;
+            std::getline(inFileStream, line);
+
+            double monthlyCost = 0.0;
+            std::unordered_set<std::string> countedSKUs;
+            while (std::getline(inFileStream, line)) {
+                std::vector<std::string> tokens = split(line, ';');
+                if (tokens.size() < 10) {
+                    continue;
+                }
+                std::string sku = tokens[6];
+                if (skus.find(sku) != skus.end() && countedSKUs.find(sku) == countedSKUs.end()) {
+                    monthlyCost += std::stod(tokens[9]);
+                    countedSKUs.insert(sku);
+                }
+            }
+
+            std::string date = years[y] + "-" + monthStr;
+            #pragma omp critical
+            {
+                monthlyCosts[date] = monthlyCost;
+            }
+        }
+    }
+}
+
+void calculateAndPrintInflation(const std::map<std::string, double>& monthlyCosts, std::map<std::string, double>& annualInflation) {
+    std::map<int, double> yearlyInflation;
+    auto it = monthlyCosts.begin();
+    auto prev = it++;
+    while (it != monthlyCosts.end()) {
+        double inflation = ((it->second - prev->second) / prev->second) * 100;
+        int year = std::stoi(it->first.substr(0, 4));
+        yearlyInflation[year] += inflation;
+        prev = it++;
+    }
+    for (const auto& [year, inflation] : yearlyInflation) {
+        annualInflation[std::to_string(year)] = inflation;
+
+        // Crear un archivo de texto para guardar los resultados
+        std::ofstream outFile("output/resultados_" + std::to_string(year) + ".txt");
+        if (outFile.is_open()) {
+            outFile << std::fixed << std::setprecision(2);  // Asegurar precisión y formato fijo
+            
+            outFile << "Costo de la canasta básica mensual:\n";
+            for (const auto& [date, cost] : monthlyCosts) {
+                if (std::stoi(date.substr(0, 4)) == year) {
+                    outFile << date << ": " << cost << "\n";
+                }
+            }
+
+            outFile << "\nInflación intermensual:\n";
+            auto it = monthlyCosts.begin();
+            auto prev = it++;
+            while (it != monthlyCosts.end()) {
+                if (std::stoi(it->first.substr(0, 4)) == year) {
+                    double inflation = ((it->second - prev->second) / prev->second) * 100;
+                    outFile << "Comparacion " << prev->first << " - " << it->first << ": " << inflation << "%\n";
+                    prev = it++;
+                } else {
+                    prev = it++;
+                }
+            }
+
+            outFile << "\nInflación anual para el año " << year << ": " << inflation << "%" << std::endl;
+            outFile.close();
+        } else {
+            std::cerr << "Error: No se pudo crear el archivo resultados_" << year << ".txt" << std::endl;
+        }
+    }
+}
+
+int main() {
+    setlocale(LC_ALL, "");
+    
+    int numThreads = omp_get_max_threads();
+    omp_set_num_threads(numThreads);
+
+    std::cout << "Número de hilos encontrados: " << numThreads << std::endl;
+
+    // Iniciar el temporizador
+    auto start = high_resolution_clock::now();
+
+    try {
+        
+        std::string inputFilename = "pd.csv";
+        std::string outputDir = "output";
+        
+        // Paso 1: Dividir el archivo principal en archivos por año
+        std::cout << "Dividiendo el archivo principal en archivos por año..." << std::endl;
+        splitFileByYearDirectly(inputFilename, 2021, 2024, outputDir);
+
+        // Paso 2: Dividir los archivos anuales en archivos mensuales
+        std::cout << "Dividiendo los archivos anuales en archivos por meses..." << std::endl;
+        std::vector<std::string> yearFiles = { outputDir + "/year_2021.csv", outputDir + "/year_2022.csv", outputDir + "/year_2023.csv", outputDir + "/year_2024.csv" };
+        #pragma omp parallel for
+        for (int i = 0; i < yearFiles.size(); ++i) {
+            processYearFile(yearFiles[i], outputDir);
+        }
+
+        // Paso 3: Procesar los SKUs comunes y calcular los costos mensuales de la canasta básica
+        std::cout << "Iniciando procesamiento de años..." << std::endl;
+
+        std::unordered_map<std::string, SKUDetails> common2021;
+        std::unordered_map<std::string, SKUDetails> common2022;
+        std::unordered_map<std::string, SKUDetails> common2023;
+        std::unordered_map<std::string, SKUDetails> common2024;
+        
+        std::map<std::string, double> monthlyAmounts2021;
+        std::map<std::string, double> monthlyAmounts2022;
+        std::map<std::string, double> monthlyAmounts2023;
+        std::map<std::string, double> monthlyAmounts2024;
+        
+        std::map<std::string, double> annualInflation2021;
+        std::map<std::string, double> annualInflation2022;
+        std::map<std::string, double> annualInflation2023;
+        std::map<std::string, double> annualInflation2024;
+        
+        std::map<std::string, double> monthlyCosts;
+        std::map<std::string, double> annualInflation;		                
+        
+        std::string inputDirectory = "output";
+        std::vector<std::string> years = {"2021", "2022", "2023", "2024"};		        
+
+        #pragma omp parallel sections
+        {
+            #pragma omp section
+            {
+                common2021 = getCommonSKUsForYear(2021);
+                saveCommonSKUs(common2021, "output/skus_comunes_2021.csv");
+            }
+            #pragma omp section
+            {
+                common2022 = getCommonSKUsForYear(2022);
+                saveCommonSKUs(common2022, "output/skus_comunes_2022.csv");
+            }
+            #pragma omp section
+            {
+                common2023 = getCommonSKUsForYear(2023);
+                saveCommonSKUs(common2023, "output/skus_comunes_2023.csv");
+            }
+            #pragma omp section
+            {
+                common2024 = getCommonSKUsForYear(2024);
+                saveCommonSKUs(common2024, "output/skus_comunes_2024.csv");
+            }
+        }
+
+        findAndSumMatchingSKUs(common2021, { "2021" }, inputDirectory, monthlyAmounts2021);
+        findAndSumMatchingSKUs(common2022, { "2022" }, inputDirectory, monthlyAmounts2022);
+        findAndSumMatchingSKUs(common2023, { "2023" }, inputDirectory, monthlyAmounts2023);
+        findAndSumMatchingSKUs(common2024, { "2024" }, inputDirectory, monthlyAmounts2024);
+
+        calculateAndPrintInflation(monthlyAmounts2021, annualInflation2021);
+        calculateAndPrintInflation(monthlyAmounts2022, annualInflation2022);
+        calculateAndPrintInflation(monthlyAmounts2023, annualInflation2023);
+        calculateAndPrintInflation(monthlyAmounts2024, annualInflation2024);
+        
+        saveResultsToFile(monthlyAmounts2021, annualInflation2021);
+        saveResultsToFile(monthlyAmounts2022, annualInflation2022);
+        saveResultsToFile(monthlyAmounts2023, annualInflation2023);
+        saveResultsToFile(monthlyAmounts2024, annualInflation2024);
+
+        std::unordered_map<std::string, SKUDetails> allCommonSKUs;
+
+        for (const auto& [sku, details] : common2021) {
+            if (common2022.find(sku) != common2022.end() &&
+                common2023.find(sku) != common2023.end() &&
+                common2024.find(sku) != common2024.end()) {
+                allCommonSKUs[sku] = details;
+            }
+        }
+        saveCommonSKUs(allCommonSKUs, "output/skus_comunes_2021_2024.csv");
+        
+        monthlyCosts.clear();
+        annualInflation.clear();
+
+        calculateMonthlyBasketCosts(allCommonSKUs, years, "output", monthlyCosts);
+
+        calculateInflation(monthlyCosts, annualInflation);
+
+        saveResultsToFile(monthlyCosts, annualInflation);
+
+        auto exchangeRates = readExchangeRates("PEN_CLP.csv");
+        
+        std::string startDate = "01/02/2021";
+        std::string endDate = "30/12/2021";
+
+        auto monthlyAverages = calculateMonthlyAverages(exchangeRates, startDate, endDate);
+        convertAndSaveResultsToCLP("output/resultados_2021.txt", "output/resultados_2021_en_CLP.txt", monthlyAverages, startDate, endDate);
+
+        startDate = "01/01/2022";
+        endDate = "30/12/2022";
+        monthlyAverages = calculateMonthlyAverages(exchangeRates, startDate, endDate);
+        convertAndSaveResultsToCLP("output/resultados_2022.txt", "output/resultados_2022_en_CLP.txt", monthlyAverages, startDate, endDate);
+
+        startDate = "01/01/2023";
+        endDate = "30/12/2023";
+        monthlyAverages = calculateMonthlyAverages(exchangeRates, startDate, endDate);
+        convertAndSaveResultsToCLP("output/resultados_2023.txt", "output/resultados_2023_en_CLP.txt", monthlyAverages, startDate, endDate);
+
+        startDate = "01/01/2024";
+        endDate = "30/12/2024";
+        monthlyAverages = calculateMonthlyAverages(exchangeRates, startDate, endDate);
+        convertAndSaveResultsToCLP("output/resultados_2024.txt", "output/resultados_2024_en_CLP.txt", monthlyAverages, startDate, endDate);
+        
+        std::cout << "\nContenido de output/resultados_2021.txt:" << std::endl;
+        printFileContents("output/resultados_2021.txt");
+        std::cout << "\nContenido de output/resultados_2022.txt:" << std::endl;
+        printFileContents("output/resultados_2022.txt");
+        std::cout << "\nContenido de output/resultados_2023.txt:" << std::endl;
+        printFileContents("output/resultados_2023.txt");
+        std::cout << "\nContenido de output/resultados_2024.txt:" << std::endl;
+        printFileContents("output/resultados_2024.txt");
+        
+        std::cout << "\nContenido de output/resultados_2021_en_CLP.txt:" << std::endl;
+        printFileContents("output/resultados_2021_en_CLP.txt");
+        std::cout << "\nContenido de output/resultados_2022_en_CLP.txt:" << std::endl;
+        printFileContents("output/resultados_2022_en_CLP.txt");
+        std::cout << "\nContenido de output/resultados_2023_en_CLP.txt:" << std::endl;
+        printFileContents("output/resultados_2023_en_CLP.txt");
+        std::cout << "\nContenido de output/resultados_2024_en_CLP.txt:" << std::endl;
+        printFileContents("output/resultados_2024_en_CLP.txt");
+        
+        startDate = "01/02/2021";
+        endDate = "30/04/2024";
+        monthlyAverages = calculateMonthlyAverages(exchangeRates, startDate, endDate);		        
+
+        convertAndSaveResultsToCLP("output/resultados.txt", "output/resultados_en_CLP.txt", monthlyAverages, startDate, endDate);
+        std::cout << "Resultados convertidos y guardados en output/resultados_en_CLP.txt" << std::endl;
+
+        // Mostrar contenido de resultados.txt
+        std::cout << "\nContenido de output/resultados.txt:" << std::endl;
+        printFileContents("output/resultados.txt");
+
+        // Mostrar contenido de resultados_en_CLP.txt
+        std::cout << "\nContenido de output/resultados_en_CLP.txt:" << std::endl;
+        printFileContents("output/resultados_en_CLP.txt");
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    // Detener el temporizador y calcular la duración
+    auto end = high_resolution_clock::now();
+    auto duration = duration_cast<seconds>(end - start).count();
+    std::cout << "Tiempo total de ejecución: " << duration << " segundos" << std::endl;
+
+    std::cout << "Presione una tecla para continuar . . ." << std::endl;
+    std::cin.get();
+
+    return 0;
+}
