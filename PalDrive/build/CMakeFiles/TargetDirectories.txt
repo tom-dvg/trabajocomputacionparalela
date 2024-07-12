@@ -1,0 +1,3 @@
+/home/zeruen/Trabajo/build/CMakeFiles/mi_programa.dir
+/home/zeruen/Trabajo/build/CMakeFiles/edit_cache.dir
+/home/zeruen/Trabajo/build/CMakeFiles/rebuild_cache.dir
